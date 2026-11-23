@@ -26,6 +26,8 @@ import org.apache.http.HttpStatus;
 import org.dependencytrack.JerseyTestExtension;
 import org.dependencytrack.ResourceTest;
 import org.dependencytrack.auth.Permissions;
+import org.dependencytrack.dex.engine.api.DexEngine;
+import org.dependencytrack.dex.engine.api.request.CreateWorkflowRunRequest;
 import org.dependencytrack.model.AnalysisJustification;
 import org.dependencytrack.model.AnalysisResponse;
 import org.dependencytrack.model.AnalysisState;
@@ -40,10 +42,16 @@ import org.dependencytrack.policy.vulnerability.VulnerabilityPolicy;
 import org.dependencytrack.policy.vulnerability.VulnerabilityPolicyAnalysis;
 import org.dependencytrack.policy.vulnerability.VulnerabilityPolicyDao;
 import org.dependencytrack.policy.vulnerability.VulnerabilityPolicyDao.VulnPolicyIdentityRow;
+import org.dependencytrack.proto.internal.workflow.v1.UpdateProjectMetricsArg;
 import org.dependencytrack.resources.v1.vo.AnalysisRequest;
+import org.glassfish.hk2.utilities.binding.AbstractBinder;
 import org.glassfish.jersey.server.ResourceConfig;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.mockito.ArgumentCaptor;
+import org.mockito.ArgumentMatchers;
+import org.mockito.Mockito;
 
 import jakarta.json.Json;
 import jakarta.json.JsonArray;
@@ -69,12 +77,30 @@ import static org.dependencytrack.persistence.jdbi.JdbiFactory.inJdbiTransaction
 import static org.dependencytrack.persistence.jdbi.JdbiFactory.useJdbiHandle;
 import static org.dependencytrack.persistence.jdbi.JdbiFactory.useJdbiTransaction;
 import static org.dependencytrack.persistence.jdbi.JdbiFactory.withJdbiHandle;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 
 class AnalysisResourceTest extends ResourceTest {
 
+    private static final DexEngine DEX_ENGINE_MOCK = mock(DexEngine.class);
+
     @RegisterExtension
-    static JerseyTestExtension jersey = new JerseyTestExtension(
-            new ResourceConfig(AnalysisResource.class).register(ApiFilter.class).register(AuthFeature.class));
+    static JerseyTestExtension jersey = new JerseyTestExtension(new ResourceConfig(AnalysisResource.class)
+            .register(ApiFilter.class)
+            .register(AuthFeature.class)
+            .register(new AbstractBinder() {
+                @Override
+                protected void configure() {
+                    bind(DEX_ENGINE_MOCK).to(DexEngine.class);
+                }
+            }));
+
+    @AfterEach
+    void afterEach() {
+        Mockito.reset(DEX_ENGINE_MOCK);
+    }
 
     @Test
     void retrieveAnalysisTest() {
@@ -1199,5 +1225,117 @@ class AnalysisResourceTest extends ResourceTest {
                         """.formatted(project.getUuid(), component.getUuid(), vuln.getUuid()),
                         MediaType.APPLICATION_JSON));
         assertThat(response.getStatus()).isEqualTo(200);
+    }
+
+    @Test
+    void updateAnalysisShouldScheduleMetricsUpdateWhenFindingIsSuppressed() {
+        initializeWithPermissions(Permissions.VULNERABILITY_ANALYSIS);
+
+        final Project project = qm.createProject("Acme Example", null, "1.0", null, null, null, null, false);
+        final Finding finding = createFinding(project);
+
+        final Response response = putAnalysis(project, finding, AnalysisState.NOT_AFFECTED, true);
+        assertThat(response.getStatus()).isEqualTo(HttpStatus.SC_OK);
+
+        //noinspection unchecked
+        final ArgumentCaptor<CreateWorkflowRunRequest<?>> captor =
+                ArgumentCaptor.forClass(CreateWorkflowRunRequest.class);
+        verify(DEX_ENGINE_MOCK).createRun(captor.capture());
+
+        final CreateWorkflowRunRequest<?> request = captor.getValue();
+        assertThat(request.workflowName()).isEqualTo("update-project-metrics-deferred");
+        assertThat(request.workflowInstanceId()).isEqualTo("update-project-metrics-deferred:" + project.getUuid());
+        assertThat(request.argument())
+                .isEqualTo(UpdateProjectMetricsArg.newBuilder()
+                        .setProjectUuid(project.getUuid().toString())
+                        .build());
+    }
+
+    @Test
+    void updateAnalysisShouldScheduleMetricsUpdateWhenFindingIsUnsuppressed() {
+        initializeWithPermissions(Permissions.VULNERABILITY_ANALYSIS);
+
+        final Project project = qm.createProject("Acme Example", null, "1.0", null, null, null, null, false);
+        final Finding finding = createFinding(project);
+
+        assertThat(putAnalysis(project, finding, AnalysisState.NOT_AFFECTED, true)
+                        .getStatus())
+                .isEqualTo(HttpStatus.SC_OK);
+        Mockito.reset(DEX_ENGINE_MOCK);
+
+        assertThat(putAnalysis(project, finding, AnalysisState.NOT_AFFECTED, false)
+                        .getStatus())
+                .isEqualTo(HttpStatus.SC_OK);
+
+        verify(DEX_ENGINE_MOCK).createRun(ArgumentMatchers.<CreateWorkflowRunRequest<?>>any());
+    }
+
+    @Test
+    void updateAnalysisShouldNotScheduleMetricsUpdateWhenSuppressionIsUnchanged() {
+        initializeWithPermissions(Permissions.VULNERABILITY_ANALYSIS);
+
+        final Project project = qm.createProject("Acme Example", null, "1.0", null, null, null, null, false);
+        final Finding finding = createFinding(project);
+
+        assertThat(putAnalysis(project, finding, AnalysisState.NOT_AFFECTED, false)
+                        .getStatus())
+                .isEqualTo(HttpStatus.SC_OK);
+        assertThat(putAnalysis(project, finding, AnalysisState.EXPLOITABLE, false)
+                        .getStatus())
+                .isEqualTo(HttpStatus.SC_OK);
+
+        verify(DEX_ENGINE_MOCK, never()).createRun(ArgumentMatchers.<CreateWorkflowRunRequest<?>>any());
+    }
+
+    @Test
+    void updateAnalysisShouldSucceedWhenSchedulingMetricsUpdateFails() {
+        initializeWithPermissions(Permissions.VULNERABILITY_ANALYSIS);
+
+        final Project project = qm.createProject("Acme Example", null, "1.0", null, null, null, null, false);
+        final Finding finding = createFinding(project);
+
+        doThrow(new IllegalStateException("simulated"))
+                .when(DEX_ENGINE_MOCK)
+                .createRun(ArgumentMatchers.<CreateWorkflowRunRequest<?>>any());
+
+        final Response response = putAnalysis(project, finding, AnalysisState.NOT_AFFECTED, true);
+        assertThat(response.getStatus()).isEqualTo(HttpStatus.SC_OK);
+        assertThat(parseJsonObject(response).getBoolean("isSuppressed")).isTrue();
+    }
+
+    private record Finding(Component component, Vulnerability vulnerability) {}
+
+    private Finding createFinding(Project project) {
+        final var component = new Component();
+        component.setProject(project);
+        component.setName("Acme Component");
+        component.setVersion("1.0");
+        qm.createComponent(component, false);
+
+        final var vulnerability = new Vulnerability();
+        vulnerability.setVulnId("INT-001");
+        vulnerability.setSource(Vulnerability.Source.INTERNAL);
+        vulnerability.setSeverity(Severity.HIGH);
+        vulnerability.setComponents(List.of(component));
+
+        return new Finding(component, qm.createVulnerability(vulnerability));
+    }
+
+    private Response putAnalysis(Project project, Finding finding, AnalysisState state, boolean suppressed) {
+        final var analysisRequest = new AnalysisRequest(
+                project.getUuid().toString(),
+                finding.component().getUuid().toString(),
+                finding.vulnerability().getUuid().toString(),
+                state,
+                AnalysisJustification.NOT_SET,
+                AnalysisResponse.NOT_SET,
+                "Analysis details here",
+                "Analysis comment here",
+                suppressed);
+
+        return jersey.target(V1_ANALYSIS)
+                .request()
+                .header(X_API_KEY, apiKey)
+                .put(Entity.entity(analysisRequest, MediaType.APPLICATION_JSON));
     }
 }

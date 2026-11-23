@@ -81,6 +81,16 @@ public interface ComponentDao extends SqlObject, PaginationSupport {
     @Nullable
     AccessibleComponentRow getComponentAccess(@Bind UUID componentUuid);
 
+    @SqlQuery("""
+            SELECT "PROJECT"."UUID"
+              FROM "COMPONENT"
+             INNER JOIN "PROJECT"
+                ON "PROJECT"."ID" = "COMPONENT"."PROJECT_ID"
+             WHERE "COMPONENT"."UUID" = :componentUuid
+            """)
+    @Nullable
+    UUID getProjectUuid(@Bind UUID componentUuid);
+
     @SqlQuery(/* language=InjectedFreeMarker */ """
             <#-- @ftlvariable name="apiFilterParameter" type="String" -->
             <#-- @ftlvariable name="apiOffsetLimitClause" type="String" -->

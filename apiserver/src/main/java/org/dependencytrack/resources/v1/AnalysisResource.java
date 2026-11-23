@@ -33,16 +33,24 @@ import io.swagger.v3.oas.annotations.security.SecurityRequirement;
 import io.swagger.v3.oas.annotations.security.SecurityRequirements;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import org.dependencytrack.auth.Permissions;
+import org.dependencytrack.dex.engine.api.DexEngine;
+import org.dependencytrack.dex.engine.api.request.CreateWorkflowRunRequest;
+import org.dependencytrack.metrics.UpdateProjectMetricsDeferredWorkflow;
 import org.dependencytrack.model.validation.ValidUuid;
 import org.dependencytrack.persistence.command.MakeAnalysisCommand;
+import org.dependencytrack.persistence.jdbi.ComponentDao;
 import org.dependencytrack.persistence.jdbi.FindingAnalysisDao;
 import org.dependencytrack.persistence.jdbi.FindingAnalysisDao.AnalysisTrail;
 import org.dependencytrack.persistence.jdbi.VulnerabilityDao;
+import org.dependencytrack.proto.internal.workflow.v1.UpdateProjectMetricsArg;
 import org.dependencytrack.resources.AbstractApiResource;
 import org.dependencytrack.resources.v1.problems.ProblemDetails;
 import org.dependencytrack.resources.v1.vo.AnalysisRequest;
 import org.dependencytrack.resources.v1.vo.AnalysisTrailResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import jakarta.inject.Inject;
 import jakarta.validation.Validator;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.GET;
@@ -54,6 +62,7 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static java.util.Objects.requireNonNull;
 import static org.dependencytrack.persistence.jdbi.JdbiFactory.inJdbiTransaction;
@@ -69,6 +78,15 @@ import static org.dependencytrack.persistence.jdbi.JdbiFactory.withJdbiHandle;
 @Tag(name = "analysis")
 @SecurityRequirements({@SecurityRequirement(name = "ApiKeyAuth"), @SecurityRequirement(name = "BearerAuth")})
 public class AnalysisResource extends AbstractApiResource {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(AnalysisResource.class);
+
+    private final DexEngine dexEngine;
+
+    @Inject
+    AnalysisResource(DexEngine dexEngine) {
+        this.dexEngine = dexEngine;
+    }
 
     @GET
     @Produces(MediaType.APPLICATION_JSON)
@@ -198,7 +216,9 @@ public class AnalysisResource extends AbstractApiResource {
                                 : apiKey.teams().getFirst().name();
                 };
 
-        return inJdbiTransaction(getAlpineRequest(), handle -> {
+        final var projectUuidToUpdate = new AtomicReference<UUID>();
+
+        final Response response = inJdbiTransaction(getAlpineRequest(), handle -> {
             final long componentId = requireComponentAccess(handle, componentUuid);
 
             final Long vulnDbId = handle.attach(VulnerabilityDao.class).getVulnDbId(vulnUuid);
@@ -208,19 +228,54 @@ public class AnalysisResource extends AbstractApiResource {
                         .build();
             }
 
-            handle.attach(FindingAnalysisDao.class)
-                    .makeAnalysis(new MakeAnalysisCommand(componentId, vulnDbId)
-                            .withState(request.getAnalysisState())
-                            .withJustification(request.getAnalysisJustification())
-                            .withResponse(request.getAnalysisResponse())
-                            .withDetails(request.getAnalysisDetails())
-                            .withSuppress(request.isSuppressed())
-                            .withCommenter(commenter)
-                            .withComment(request.getComment()));
-
             final var analysisDao = handle.attach(FindingAnalysisDao.class);
-            return Response.ok(AnalysisTrailResponse.of(requireNonNull(analysisDao.getTrail(componentId, vulnDbId))))
-                    .build();
+            final AnalysisTrail trailBefore = analysisDao.getTrail(componentId, vulnDbId);
+
+            analysisDao.makeAnalysis(new MakeAnalysisCommand(componentId, vulnDbId)
+                    .withState(request.getAnalysisState())
+                    .withJustification(request.getAnalysisJustification())
+                    .withResponse(request.getAnalysisResponse())
+                    .withDetails(request.getAnalysisDetails())
+                    .withSuppress(request.isSuppressed())
+                    .withCommenter(commenter)
+                    .withComment(request.getComment()));
+
+            final AnalysisTrail trailAfter = requireNonNull(analysisDao.getTrail(componentId, vulnDbId));
+
+            final boolean suppressedBefore = trailBefore != null && trailBefore.suppressed();
+            if (suppressedBefore != trailAfter.suppressed()) {
+                projectUuidToUpdate.set(handle.attach(ComponentDao.class).getProjectUuid(componentUuid));
+            }
+
+            return Response.ok(AnalysisTrailResponse.of(trailAfter)).build();
         });
+
+        if (projectUuidToUpdate.get() != null) {
+            scheduleProjectMetricsUpdate(projectUuidToUpdate.get());
+        }
+
+        return response;
+    }
+
+    /**
+     * Suppressing or unsuppressing a finding changes the metrics of its project.
+     * Recomputing them is expensive, so it is deferred to a workflow that coalesces
+     * multiple changes to the same project into a single update.
+     * <p>
+     * Failing to schedule the update must not fail the analysis request, since the
+     * analysis has already been recorded, and metrics are refreshed periodically anyway.
+     */
+    private void scheduleProjectMetricsUpdate(UUID projectUuid) {
+        try {
+            // A null result means a run for this project is still pending,
+            // which will pick up this change as well.
+            dexEngine.createRun(new CreateWorkflowRunRequest<>(UpdateProjectMetricsDeferredWorkflow.class)
+                    .withWorkflowInstanceId(UpdateProjectMetricsDeferredWorkflow.instanceId(projectUuid))
+                    .withArgument(UpdateProjectMetricsArg.newBuilder()
+                            .setProjectUuid(projectUuid.toString())
+                            .build()));
+        } catch (RuntimeException e) {
+            LOGGER.warn("Failed to schedule metrics update for project {}", projectUuid, e);
+        }
     }
 }
